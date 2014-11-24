@@ -11,7 +11,7 @@ class CircuitSuite extends CircuitSimulator with FunSuite {
   val AndGateDelay = 3
   val OrGateDelay = 5
   
-  ignore("andGate example") {
+  test("andGate example") {
     val in1, in2, out = new Wire
     andGate(in1, in2, out)
     in1.setSignal(false)
@@ -34,7 +34,7 @@ class CircuitSuite extends CircuitSimulator with FunSuite {
   //
   // to complete with tests for orGate, demux, ...
   //
-  ignore("demux") {
+  test("demux") {
     val in0, in1,in2 = new Wire
     val out0, out1,out2,out3,out4,out5,out6,out7 = new Wire
     val c = List(in0,in1,in2)
@@ -71,7 +71,7 @@ class CircuitSuite extends CircuitSimulator with FunSuite {
     
   }
   
-  ignore ("empty demux" ) {
+  test ("empty demux" ) {
     val out0, input = new Wire
    input.setSignal(true)
     val out = List(out0)

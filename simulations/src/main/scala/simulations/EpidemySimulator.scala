@@ -46,7 +46,7 @@ class EpidemySimulator extends Simulator {
     def isRoomInfected = { personList.exists(p => p.infected) }
 
     def addPerson(p: Person) {
-      personList = personList + p
+      personList = p :: personList
       p.row = row
       p.col = col
     }
