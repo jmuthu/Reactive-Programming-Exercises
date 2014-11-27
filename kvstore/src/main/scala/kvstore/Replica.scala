@@ -11,7 +11,7 @@ import scala.concurrent.duration._
 import akka.actor.PoisonPill
 import akka.actor.OneForOneStrategy
 import akka.actor.SupervisorStrategy
-import akka.util.Timeout
+import akka.actor.Cancellable
 
 object Replica {
   sealed trait Operation {
@@ -30,6 +30,7 @@ object Replica {
   case class FailedTimeout(id: Long)
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
+
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
@@ -38,6 +39,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   import Persistence._
   import context.dispatcher
 
+  class Ack(val source: ActorRef, val receivers: Set[ActorRef], val persistOpSchedule: Option[Cancellable], val failedOpSchedule: Option[Cancellable])
+
   // Variables to hold state of the Actor
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
@@ -45,7 +48,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
   // the list of actors waiting for ack
-  var pendingAck = Map.empty[Long, (ActorRef, String, Option[String], Set[ActorRef])]
+  var pendingAck = Map.empty[Long, Ack]
   // variable to create ids for sending replicate messages
   var _seqCounter = -1L
   def nextSeq = {
@@ -69,44 +72,37 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   }
 
   // Changing states of Pending variable
-  def insertPendingAck(key: String, valueOption: Option[String], id: Long, children: Set[ActorRef]) {
+  def insertPendingAck(id: Long,
+    children: Set[ActorRef],
+    persistScheduleOption: Option[Cancellable] = None,
+    failedScheduleOption: Option[Cancellable] = None) {
     if (pendingAck contains id) {
-      val (source, key, value, list) = pendingAck(id)
-      pendingAck += (id -> (source, key, value, list ++ children))
+      val ack = pendingAck(id)
+      pendingAck += (id -> new Ack(ack.source, ack.receivers ++ children, ack.persistOpSchedule, ack.failedOpSchedule))
     } else
-      pendingAck += (id -> (sender, key, valueOption, children))
+      pendingAck += (id -> new Ack(sender, children, persistScheduleOption, failedScheduleOption))
   }
 
-  def removePendingAck(id: Long, child: ActorRef, ack: Option[Any] = None) = {
-    if (pendingAck contains id) {
-      val (source, key, value, list) = pendingAck(id)
-      val newList = list - child
-      if (newList.isEmpty)
-        removePendingId(id, source, ack)
-      else {
-        pendingAck += (id -> (source, key, value, newList))
-      }
-    }
+  def removePendingReceiver(id: Long, receiver: ActorRef)(implicit response: (ActorRef, Long) => Unit) = if (pendingAck contains id) {
+    val ack = pendingAck(id)
+    val newList = ack.receivers - receiver
+    if (newList.isEmpty)
+      removePendingId(id, ack)
+    else if (persistence == receiver) {
+      ack.persistOpSchedule.get.cancel
+      pendingAck += (id -> new Ack(ack.source, newList, None, ack.failedOpSchedule))
+    } else if (newList.size == 1 && newList.contains(persistence) && ack.failedOpSchedule.isDefined) {
+      ack.failedOpSchedule.get.cancel
+      pendingAck += (id -> new Ack(ack.source, newList, ack.persistOpSchedule, None))
+    } else
+      pendingAck += (id -> new Ack(ack.source, newList, ack.persistOpSchedule, ack.failedOpSchedule))
   }
 
-  def removePendingId(id: Long, source: ActorRef, ack: Option[Any]) = {
+  def removePendingId(id: Long, ack: Ack)(implicit response: (ActorRef, Long) => Unit) = {
     pendingAck -= id
-    ack match {
-      case Some(a) => source ! a
-      case None =>
-    }
-  }
-
-  def removePendingAllAck(id: Long, ack: Option[Any]) = {
-    if (pendingAck.contains(id)) {
-      val (source, key, value, list) = pendingAck(id)
-      removePendingId(id, source, ack)
-    }
-  }
-
-  def removeAllPendingAck(receiver: ActorRef)(response: Long => Any) = {
-    pendingAck.foreach { case (id, (s, k, v, l)) => removePendingAck(id, receiver, Option(response(id))) }
-    context.unwatch(receiver)
+    if (ack.failedOpSchedule.isDefined) ack.failedOpSchedule.get.cancel
+    if (ack.persistOpSchedule.isDefined) ack.persistOpSchedule.get.cancel
+    response(ack.source, id)
   }
 
   // Helpers for receive messages
@@ -115,46 +111,45 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   def get(key: String, id: Long) = sender ! GetResult(key, kv.get(key), id)
 
   // Persist Helpers
-  def persisted(id: Long, ack: Any) = removePendingAck(id, persistence, Option(ack))
+  def persist(key: String,
+    valueOption: Option[String],
+    id: Long,
+    failedOpSchedule: Option[Cancellable] = None) = {
 
-  def setTimeoutForPersistAck = context.system.scheduler.scheduleOnce(100.millisecond, self, Timeout)
-
-  def persist(key: String, valueOption: Option[String], id: Long) = {
-    insertPendingAck(key, valueOption, id, Set(persistence))
     valueOption match {
       case Some(v) => kv += (key -> v)
       case None => kv = kv - key
     }
-    persistence ! Persist(key, valueOption, id)
-    setTimeoutForPersistAck
-  }
-
-  def persistTimeout = {
-    if (!pendingAck.isEmpty) {
-      pendingAck.foreach {
-        case (id, (source, key, valueOption, repList)) => if (repList contains persistence) persistence ! Persist(key, valueOption, id)
-      }
-      setTimeoutForPersistAck
-    }
+    val persistOpSchedule = context.system.scheduler.schedule(0.milliseconds, 100.milliseconds, persistence, Persist(key, valueOption, id))
+    insertPendingAck(id, Set(persistence), Option(persistOpSchedule), failedOpSchedule)
   }
 
   // Replicate Helpers
   def replicate(key: String, valueOption: Option[String], id: Long, reps: Set[ActorRef]) = {
-    insertPendingAck(key, valueOption, id, reps)
+    insertPendingAck(id, reps)
     reps.foreach(_ ! Replicate(key, valueOption, id))
   }
 
+  // Updates from clients
+  def handleUpdates(key: String, valueOption: Option[String], id: Long) = {
+    val failedOpSchedule = context.system.scheduler.scheduleOnce(1.second, self, FailedTimeout(id))
+    persist(key, valueOption, id, Option(failedOpSchedule))
+    replicate(key, valueOption, id, replicators)
+  }
+
+  // Handle Arbiter replica
   def handleReplicas(replicas: Set[ActorRef]) = {
     val newReplicas = (replicas - self) -- secondaries.keys
     val terminatedReplicas = secondaries.keys.toSet -- replicas
 
     val newReplicators = for (r <- newReplicas) yield {
       val replicator = context.actorOf(Replicator.props(r))
-      replicators += replicator
       secondaries += (r -> replicator)
       context.watch(replicator)
       replicator
     }
+    replicators ++= newReplicators
+
     for ((k, v) <- kv) yield {
       val updateId = nextSeq
       replicate(k, Option(v), updateId, newReplicators)
@@ -164,18 +159,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       val replicator = secondaries(replica)
       secondaries -= replica
       replicators -= replicator
-      removeAllPendingAck(replicator)(OperationAck(_))
+      pendingAck.foreach { case (id, ack) => removePendingReceiver(id, replicator)((source, id) => source ! OperationAck(id)) }
+      context.unwatch(replicator)
       context.stop(replicator)
     }
-  }
-
-  // Terminate Helpers
-
-  // Updates from clients
-  def handleUpdates(key: String, valueOption: Option[String], id: Long) = {
-    persist(key, valueOption, id)
-    replicate(key, valueOption, id, replicators)
-    context.system.scheduler.scheduleOnce(1.second, self, FailedTimeout(id))
   }
 
   // Receive Functions 
@@ -185,43 +172,47 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case JoinedSecondary => context.become(replica)
   }
 
-  val leader: Receive = {
+  def common(stopOnPersistTermination: Boolean, ack: (String, Long) => Any): Receive = {
     // Request
     case g: Get => get(g.key, g.id)
+    // Responses
+    case p: Persisted => removePendingReceiver(p.id, persistence)((source, id) => source ! ack(p.key, id))
+    // Exceptions
+    case Terminated(persister) => {
+      context.unwatch(persister)
+      if (stopOnPersistTermination) {
+        pendingAck.foreach { case (id, ack) => removePendingReceiver(id, persister)((_, _) => ()) }
+        context.stop(self)
+      } else {
+        pendingAck.foreach { case (id, ack) => removePendingReceiver(id, persister)((source, id) => source ! OperationFailed(id)) }
+      }
+
+    }
+
+  }
+
+  val leader: Receive = common(false, (key, id) => OperationAck(id)) orElse {
+    // Request
     case i: Insert => handleUpdates(i.key, Option(i.value), i.id)
     case r: Remove => handleUpdates(r.key, None, r.id)
     case rep: Replicas => handleReplicas(rep.replicas)
 
     // Responses
-    case p: Persisted => persisted(p.id, OperationAck(p.id))
-    case replicated: Replicated => removePendingAck(replicated.id, sender, Option(OperationAck(replicated.id)))
+    case replicated: Replicated => removePendingReceiver(replicated.id, sender)((source, id) => source ! OperationAck(id))
 
     // Exceptions
-    case Timeout => persistTimeout
-    case FailedTimeout(id) => removePendingAllAck(id, Option(OperationFailed(id)))
-    case Terminated(a) => removeAllPendingAck(a)(OperationFailed(_))
+    case FailedTimeout(id) => if (pendingAck.contains(id)) {
+      removePendingId(id, pendingAck(id))((source, id) => source ! OperationFailed(id))
+    }
   }
 
-  val replica: Receive = {
+  val replica: Receive = common(true, SnapshotAck) orElse {
     // Request
-    case g: Get => get(g.key, g.id)
-    case s: Snapshot => {
-      if (expectedNumber > s.seq)
-        sender ! SnapshotAck(s.key, s.seq)
-      else if (expectedNumber == s.seq) {
-        expectedNumber += 1
-        persist(s.key, s.valueOption, s.seq)
-      }
-    }
-
-    // Responses
-    case p: Persisted => persisted(p.id, SnapshotAck(p.key, p.id))
-
-    // Exceptions
-    case Timeout => persistTimeout
-    case Terminated(a) => {
-      removeAllPendingAck(a)(_ => None)
-      context.stop(self)
+    case s: Snapshot => if (expectedNumber > s.seq) {
+      sender ! SnapshotAck(s.key, s.seq)
+    } else if (expectedNumber == s.seq) {
+      expectedNumber += 1
+      persist(s.key, s.valueOption, s.seq)
     }
   }
 

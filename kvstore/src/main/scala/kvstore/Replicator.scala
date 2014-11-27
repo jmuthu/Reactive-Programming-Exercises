@@ -3,8 +3,8 @@ package kvstore
 import akka.actor.Props
 import akka.actor.Actor
 import akka.actor.ActorRef
+import akka.actor.Cancellable
 import scala.concurrent.duration._
-import akka.util.Timeout
 
 object Replicator {
   case class Replicate(key: String, valueOption: Option[String], id: Long)
@@ -12,7 +12,7 @@ object Replicator {
 
   case class Snapshot(key: String, valueOption: Option[String], seq: Long)
   case class SnapshotAck(key: String, seq: Long)
-
+  
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
 
@@ -22,9 +22,7 @@ class Replicator(val replica: ActorRef) extends Actor {
   import context.dispatcher
 
   // map from sequence number to pair of sender and request
-  var acks = Map.empty[Long, (ActorRef, Replicate)]
-  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
-  // var pending = Vector.empty[Snapshot]
+  var acks = Map.empty[Long, (ActorRef, Replicate, Cancellable)]
 
   var _seqCounter = 0L
   def nextSeq = {
@@ -32,28 +30,22 @@ class Replicator(val replica: ActorRef) extends Actor {
     _seqCounter += 1
     ret
   }
-
-  def timeout = context.system.scheduler.scheduleOnce(100.milliseconds, self, Timeout)
-
-  def sendSnapshot(key: String, valueOption: Option[String], seq: Long) = replica ! Snapshot(key, valueOption, seq)
+  
+  override def postStop = {
+   acks.foreach{case (id,(a,r,schedule)) => schedule.cancel}
+  }
 
   def receive: Receive = {
     case r: Replicate => {
       val seq = nextSeq
-      acks += (seq -> (sender, r))
-      sendSnapshot(r.key, r.valueOption, seq)
-      timeout
+      val schedule = context.system.scheduler.schedule(0.milliseconds, 100.milliseconds, replica, Snapshot(r.key, r.valueOption, seq))
+      acks += (seq -> (sender, r, schedule))
     }
-    case s: SnapshotAck => {
-      val (primary, replicate) = acks(s.seq)
+    case s: SnapshotAck => if (acks contains s.seq) {
+      val (primary, replicate, schedule) = acks(s.seq)
+      schedule.cancel
       acks -= s.seq
       primary ! Replicated(s.key, replicate.id)
-    }
-    case Timeout => {
-      if (!acks.isEmpty) {
-        acks.foreach { case (seq, (primary, replicate)) => sendSnapshot(replicate.key, replicate.valueOption, seq) }
-        timeout
-      }
     }
   }
 
